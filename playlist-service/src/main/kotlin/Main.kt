@@ -2,37 +2,32 @@ import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.response.*
+import io.ktor.server.request.*
 import io.ktor.server.routing.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.plugins.contentnegotiation.*
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import org.slf4j.LoggerFactory
 import com.rabbitmq.client.ConnectionFactory
 import com.rabbitmq.client.Connection
 import com.rabbitmq.client.Channel
-import org.slf4j.LoggerFactory
+import java.net.HttpURLConnection
+import java.net.URL
 
 @Serializable
 data class Playlist(
     val id: Int,
     val name: String,
-    val userId: Int,
-    val tracksCount: Int,
-    val isPublic: Boolean,
-    val description: String
-)
-
-@Serializable
-data class PlaylistTrack(
-    val playlistId: Int,
-    val trackId: Int,
-    val trackTitle: String,
-    val artist: String,
-    val addedAt: String
+    val tracks: List<Int> = emptyList(),
+    val owner: String = "" // <-- дефолт, чтобы POST не требовал поле
 )
 
 @Serializable
@@ -50,7 +45,86 @@ data class EventMessage(
     val data: JsonElement
 )
 
-// RabbitMQ Helper
+// ---------- АВТОРИЗАЦИЯ ----------
+@Serializable
+data class AuthUser(
+    val id: String,
+    val username: String,
+    val roles: List<String> = emptyList()
+)
+
+private val jsonAuth = Json { ignoreUnknownKeys = true }
+
+private fun validateTokenViaAuthService(token: String): AuthUser? {
+    val urlStr = System.getenv("AUTH_VALIDATE_URL")
+        ?: "http://auth-service:8080/api/auth/validate"
+    val url = URL(urlStr)
+
+    println("🔍 [AuthValidator] Проверка токена через $urlStr")
+
+    val conn = (url.openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        doOutput = true
+        setFixedLengthStreamingMode(0)
+        setRequestProperty("Authorization", "Bearer $token")
+        connectTimeout = 8000
+        readTimeout = 8000
+        instanceFollowRedirects = false
+    }
+
+    return try {
+        conn.outputStream.use { /* пустое тело */ }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+
+        println("ℹ️ [AuthValidator] Ответ от auth-service: HTTP $code")
+
+        if (stream != null) {
+            val body = stream.bufferedReader().use { it.readText() }
+            println("📦 [AuthValidator] Тело ответа: $body")
+
+            if (code == 200) {
+                val user = jsonAuth.decodeFromString<AuthUser>(body)
+                println("✅ [AuthValidator] Успешная валидация токена для пользователя: ${user.username}")
+                user
+            } else {
+                println("⚠️ [AuthValidator] Ошибка валидации токена: $body")
+                null
+            }
+        } else {
+            println("⚠️ [AuthValidator] Пустой ответ от auth-service")
+            null
+        }
+    } catch (ex: Exception) {
+        println("❌ [AuthValidator] Ошибка при обращении к auth-service: ${ex.message}")
+        ex.printStackTrace()
+        null
+    } finally {
+        conn.disconnect()
+        println("🔚 [AuthValidator] Подключение закрыто\n")
+    }
+}
+
+private suspend fun authenticateOrReject(call: ApplicationCall, requiredRole: String? = null): AuthUser? {
+    val hdr = call.request.headers[HttpHeaders.Authorization]
+    if (hdr.isNullOrBlank() || !hdr.startsWith("Bearer ")) {
+        call.respond(HttpStatusCode.Unauthorized, ApiResponse("playlist-service", "Missing or invalid Authorization header"))
+        return null
+    }
+    val token = hdr.removePrefix("Bearer ").trim()
+    val user = validateTokenViaAuthService(token) ?: run {
+        call.respond(HttpStatusCode.Unauthorized, ApiResponse("playlist-service", "Invalid or expired token"))
+        return null
+    }
+    if (requiredRole != null && !user.roles.contains(requiredRole)) {
+        call.respond(HttpStatusCode.Forbidden, ApiResponse("playlist-service", "Insufficient permissions"))
+        return null
+    }
+    return user
+}
+// ---------- /АВТОРИЗАЦИЯ ----------
+
+// RabbitMQ
 class RabbitMQPublisher {
     private val logger = LoggerFactory.getLogger(RabbitMQPublisher::class.java)
     private var connection: Connection? = null
@@ -69,19 +143,11 @@ class RabbitMQPublisher {
                 username = System.getenv("RABBITMQ_USER") ?: "admin"
                 password = System.getenv("RABBITMQ_PASS") ?: "admin123"
             }
-
             connection = factory.newConnection()
             channel = connection?.createChannel()
-
-            // Создаем exchange
             channel?.exchangeDeclare(EXCHANGE_NAME, "topic", true)
-
-            // Создаем очередь
             channel?.queueDeclare(PLAYLIST_QUEUE, true, false, false, null)
-
-            // Привязываем очередь к exchange
             channel?.queueBind(PLAYLIST_QUEUE, EXCHANGE_NAME, "playlist.#")
-
             logger.info("✅ Connected to RabbitMQ: ${factory.host}:${factory.port}")
         } catch (e: Exception) {
             logger.error("❌ Failed to connect to RabbitMQ: ${e.message}")
@@ -90,9 +156,8 @@ class RabbitMQPublisher {
 
     fun publishEvent(routingKey: String, event: EventMessage) {
         try {
-            val message = Json.encodeToString(event)
+            val message = Json.encodeToString(EventMessage.serializer(), event)
             channel?.basicPublish(EXCHANGE_NAME, routingKey, null, message.toByteArray())
-            logger.info("📤 Published event: $routingKey -> ${event.eventType}")
         } catch (e: Exception) {
             logger.error("❌ Failed to publish event: ${e.message}")
         }
@@ -101,145 +166,115 @@ class RabbitMQPublisher {
     fun close() {
         channel?.close()
         connection?.close()
-        logger.info("🔌 Disconnected from RabbitMQ")
     }
-}
-
-inline fun <reified T> createResponse(service: String, message: String, data: T): ApiResponse {
-    return ApiResponse(
-        service = service,
-        message = message,
-        data = Json.encodeToJsonElement(data)
-    )
 }
 
 fun main() {
     val logger = LoggerFactory.getLogger("PlaylistService")
     val rabbitmq = RabbitMQPublisher()
-
-    // Подключаемся к RabbitMQ
     rabbitmq.connect()
-
-    // Shutdown hook
-    Runtime.getRuntime().addShutdownHook(Thread {
-        rabbitmq.close()
-    })
+    Runtime.getRuntime().addShutdownHook(Thread { rabbitmq.close() })
 
     embeddedServer(Netty, port = 8080, host = "0.0.0.0") {
-        install(ContentNegotiation) {
-            json()
-        }
+        install(ContentNegotiation) { json() }
 
         routing {
             route("/api/playlists") {
+
                 get {
+                    val user = authenticateOrReject(call, requiredRole = "USER") ?: return@get
+
                     val playlists = listOf(
-                        Playlist(1, "My Favorites", 1, 25, true, "Моя любимая музыка"),
-                        Playlist(2, "Workout Mix", 1, 40, false, "Музыка для тренировок"),
-                        Playlist(3, "Chill Vibes", 2, 15, true, "Расслабляющая музыка")
+                        Playlist(1, "My Rock", listOf(1, 3), owner = user.username),
+                        Playlist(2, "Chill", listOf(2), owner = user.username)
                     )
 
-                    // Отправляем событие в RabbitMQ
+                    // buildJsonObject вместо mapOf<String, Any>
+                    val eventData = buildJsonObject {
+                        put("count", playlists.size)
+                        put("user", user.username)
+                    }
                     rabbitmq.publishEvent(
                         "playlist.list",
                         EventMessage(
                             eventType = "PLAYLISTS_LISTED",
                             service = "playlist-service",
                             timestamp = System.currentTimeMillis(),
-                            data = Json.encodeToJsonElement(mapOf("count" to playlists.size))
+                            data = eventData
                         )
                     )
 
-                    call.respond(createResponse("playlist-service", "Список всех плейлистов", playlists))
+                    call.respond(
+                        ApiResponse(
+                            "playlist-service",
+                            "Список плейлистов пользователя",
+                            Json.encodeToJsonElement(playlists)
+                        )
+                    )
                 }
 
                 get("/{id}") {
+                    val user = authenticateOrReject(call, requiredRole = "USER") ?: return@get
+
                     val id = call.parameters["id"]?.toIntOrNull()
                     if (id == null) {
-                        call.respond(
-                            HttpStatusCode.BadRequest,
-                            ApiResponse("playlist-service", "Некорректный ID плейлиста", null)
-                        )
+                        call.respond(HttpStatusCode.BadRequest, ApiResponse("playlist-service", "Некорректный ID плейлиста"))
                         return@get
                     }
 
-                    val playlist = Playlist(id, "Playlist #$id", 1, 10, true, "Description")
+                    val pl = Playlist(id, "List #$id", listOf(1, 2, 3), owner = user.username)
 
-                    // Отправляем событие
+                    val eventData = buildJsonObject {
+                        put("playlistId", id)
+                        put("user", user.username)
+                    }
                     rabbitmq.publishEvent(
                         "playlist.view",
                         EventMessage(
                             eventType = "PLAYLIST_VIEWED",
                             service = "playlist-service",
                             timestamp = System.currentTimeMillis(),
-                            data = Json.encodeToJsonElement(playlist)
+                            data = eventData
                         )
                     )
 
-                    call.respond(createResponse("playlist-service", "Информация о плейлисте", playlist))
+                    call.respond(
+                        ApiResponse(
+                            "playlist-service",
+                            "Информация о плейлисте",
+                            Json.encodeToJsonElement(pl)
+                        )
+                    )
                 }
 
-                get("/{id}/tracks") {
-                    val id = call.parameters["id"]?.toIntOrNull()
-                    if (id == null) {
-                        call.respond(
-                            HttpStatusCode.BadRequest,
-                            ApiResponse("playlist-service", "Некорректный ID плейлиста", null)
-                        )
-                        return@get
+                post {
+                    val user = authenticateOrReject(call, requiredRole = "USER") ?: return@post
+
+                    val req = call.receive<Playlist>()  // owner может не приходить (дефолт есть)
+                    val created = req.copy(id = (1000..9999).random(), owner = user.username)
+
+                    val eventData = buildJsonObject {
+                        put("playlistId", created.id)
+                        put("user", user.username)
                     }
-
-                    val tracks = listOf(
-                        PlaylistTrack(id, 1, "Bohemian Rhapsody", "Queen", "2024-01-15T10:30:00"),
-                        PlaylistTrack(id, 5, "Imagine", "John Lennon", "2024-01-16T14:20:00")
-                    )
-
-                    // Отправляем событие
                     rabbitmq.publishEvent(
-                        "playlist.tracks.view",
+                        "playlist.created",
                         EventMessage(
-                            eventType = "PLAYLIST_TRACKS_VIEWED",
+                            eventType = "PLAYLIST_CREATED",
                             service = "playlist-service",
                             timestamp = System.currentTimeMillis(),
-                            data = Json.encodeToJsonElement(mapOf(
-                                "playlistId" to id,
-                                "tracksCount" to tracks.size
-                            ))
+                            data = eventData
                         )
                     )
 
-                    call.respond(createResponse("playlist-service", "Треки плейлиста #$id", tracks))
-                }
-
-                get("/user/{userId}") {
-                    val userId = call.parameters["userId"]?.toIntOrNull()
-                    if (userId == null) {
-                        call.respond(
-                            HttpStatusCode.BadRequest,
-                            ApiResponse("playlist-service", "Некорректный ID пользователя", null)
-                        )
-                        return@get
-                    }
-
-                    val playlists = listOf(
-                        Playlist(100, "User $userId Playlist", userId, 8, true, "Мой плейлист")
-                    )
-
-                    // Отправляем событие
-                    rabbitmq.publishEvent(
-                        "playlist.user.view",
-                        EventMessage(
-                            eventType = "USER_PLAYLISTS_VIEWED",
-                            service = "playlist-service",
-                            timestamp = System.currentTimeMillis(),
-                            data = Json.encodeToJsonElement(mapOf(
-                                "userId" to userId,
-                                "playlistsCount" to playlists.size
-                            ))
+                    call.respond(
+                        HttpStatusCode.Created,
+                        ApiResponse(
+                            "playlist-service",
+                            "Плейлист создан",
+                            Json.encodeToJsonElement(created)
                         )
                     )
-
-                    call.respond(createResponse("playlist-service", "Плейлисты пользователя #$userId", playlists))
                 }
             }
         }

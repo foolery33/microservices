@@ -86,6 +86,20 @@ services:
       rabbitmq:
         condition: service_healthy
     networks:
+
+      - music-network
+  # Auth Service
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    expose:
+      - "8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
       - music-network
 
 networks:
