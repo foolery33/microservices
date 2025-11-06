@@ -22,6 +22,8 @@ dependencies {
     implementation("ch.qos.logback:logback-classic:1.4.14")
     // Для генерации и валидации JWT
     implementation("com.auth0:java-jwt:4.4.0")
+    // Logstash encoder для JSON логирования
+    implementation("net.logstash.logback:logstash-logback-encoder:7.4")
 }
 
 // Упаковка в fat‑jar

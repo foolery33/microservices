@@ -23,6 +23,8 @@ dependencies {
 
     // Logging
     implementation("ch.qos.logback:logback-classic:1.4.14")
+    // Logstash encoder для JSON логирования
+    implementation("net.logstash.logback:logstash-logback-encoder:7.4")
 }
 
 tasks.jar {

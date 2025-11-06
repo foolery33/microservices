@@ -19,6 +19,59 @@ services:
     networks:
       - music-network
 
+  # Elasticsearch - хранилище логов
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - music-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Logstash - обработчик логов
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: logstash
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml
+      - logs-volume:/logs
+    ports:
+      - "5001:5001"
+      - "9600:9600"
+    environment:
+      - "LS_JAVA_OPTS=-Xmx256m -Xms256m"
+    networks:
+      - music-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # Kibana - UI для просмотра логов
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - music-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
   # NGINX Gateway
   nginx-gateway:
     image: nginx:alpine
@@ -27,9 +80,26 @@ services:
       - "80:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - logs-volume:/var/log/nginx-json
     depends_on:
       - catalog-service
       - playlist-service
+    networks:
+      - music-network
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    expose:
+      - "8080"
+    volumes:
+      - logs-volume:/logs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
     networks:
       - music-network
 
@@ -46,6 +116,8 @@ services:
       RABBITMQ_PASS: admin123
     expose:
       - "8080"
+    volumes:
+      - logs-volume:/logs
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -65,6 +137,8 @@ services:
       RABBITMQ_PASS: admin123
     expose:
       - "8080"
+    volumes:
+      - logs-volume:/logs
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -82,25 +156,19 @@ services:
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: admin
       RABBITMQ_PASS: admin123
+    volumes:
+      - logs-volume:/logs
     depends_on:
       rabbitmq:
         condition: service_healthy
     networks:
+      - music-network
 
-      - music-network
-  # Auth Service
-  auth-service:
-    build:
-      context: ./auth-service
-      dockerfile: Dockerfile
-    container_name: auth-service
-    expose:
-      - "8080"
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    networks:
-      - music-network
+volumes:
+  elasticsearch-data:
+    driver: local
+  logs-volume:
+    driver: local
 
 networks:
   music-network:

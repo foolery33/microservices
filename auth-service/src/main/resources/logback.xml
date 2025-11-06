@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+	<!-- JSON encoder для логов -->
+	<appender name="FILE" class="ch.qos.logback.core.FileAppender">
+		<file>/logs/auth-service.log</file>
+		<encoder class="net.logstash.logback.encoder.LogstashEncoder">
+			<includeMdcKeyName>request_id</includeMdcKeyName>
+			<includeMdcKeyName>user</includeMdcKeyName>
+			<customFields>{"service":"auth-service"}</customFields>
+		</encoder>
+	</appender>
+
+	<!-- Console appender для разработки -->
+	<appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+		<encoder>
+			<pattern>%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} [request_id=%X{request_id}] - %msg%n</pattern>
+		</encoder>
+	</appender>
+
+	<root level="INFO">
+		<appender-ref ref="FILE"/>
+		<appender-ref ref="CONSOLE"/>
+	</root>
+</configuration>

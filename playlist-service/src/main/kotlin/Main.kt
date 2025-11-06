@@ -16,18 +16,20 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import org.slf4j.LoggerFactory
+import org.slf4j.MDC
 import com.rabbitmq.client.ConnectionFactory
 import com.rabbitmq.client.Connection
 import com.rabbitmq.client.Channel
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 
 @Serializable
 data class Playlist(
     val id: Int,
     val name: String,
     val tracks: List<Int> = emptyList(),
-    val owner: String = "" // <-- дефолт, чтобы POST не требовал поле
+    val owner: String = ""
 )
 
 @Serializable
@@ -53,20 +55,22 @@ data class AuthUser(
     val roles: List<String> = emptyList()
 )
 
+private val logger = LoggerFactory.getLogger("PlaylistService")
 private val jsonAuth = Json { ignoreUnknownKeys = true }
 
-private fun validateTokenViaAuthService(token: String): AuthUser? {
+private fun validateTokenViaAuthService(token: String, requestId: String): AuthUser? {
     val urlStr = System.getenv("AUTH_VALIDATE_URL")
         ?: "http://auth-service:8080/api/auth/validate"
     val url = URL(urlStr)
 
-    println("🔍 [AuthValidator] Проверка токена через $urlStr")
+    logger.info("Validating token via auth-service")
 
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
         doOutput = true
         setFixedLengthStreamingMode(0)
         setRequestProperty("Authorization", "Bearer $token")
+        setRequestProperty("X-Request-ID", requestId)  // Передаем Request ID
         connectTimeout = 8000
         readTimeout = 8000
         instanceFollowRedirects = false
@@ -77,49 +81,50 @@ private fun validateTokenViaAuthService(token: String): AuthUser? {
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
 
-        println("ℹ️ [AuthValidator] Ответ от auth-service: HTTP $code")
-
         if (stream != null) {
             val body = stream.bufferedReader().use { it.readText() }
-            println("📦 [AuthValidator] Тело ответа: $body")
 
             if (code == 200) {
                 val user = jsonAuth.decodeFromString<AuthUser>(body)
-                println("✅ [AuthValidator] Успешная валидация токена для пользователя: ${user.username}")
+                logger.info("Token validated successfully for user=${user.username}")
                 user
             } else {
-                println("⚠️ [AuthValidator] Ошибка валидации токена: $body")
+                logger.warn("Token validation failed with status=$code")
                 null
             }
         } else {
-            println("⚠️ [AuthValidator] Пустой ответ от auth-service")
+            logger.warn("Empty response from auth-service")
             null
         }
     } catch (ex: Exception) {
-        println("❌ [AuthValidator] Ошибка при обращении к auth-service: ${ex.message}")
-        ex.printStackTrace()
+        logger.error("Error validating token: ${ex.message}", ex)
         null
     } finally {
         conn.disconnect()
-        println("🔚 [AuthValidator] Подключение закрыто\n")
     }
 }
 
 private suspend fun authenticateOrReject(call: ApplicationCall, requiredRole: String? = null): AuthUser? {
+    val requestId = MDC.get("request_id")
     val hdr = call.request.headers[HttpHeaders.Authorization]
     if (hdr.isNullOrBlank() || !hdr.startsWith("Bearer ")) {
+        logger.warn("Missing or invalid Authorization header")
         call.respond(HttpStatusCode.Unauthorized, ApiResponse("playlist-service", "Missing or invalid Authorization header"))
         return null
     }
     val token = hdr.removePrefix("Bearer ").trim()
-    val user = validateTokenViaAuthService(token) ?: run {
+    val user = validateTokenViaAuthService(token, requestId) ?: run {
+        logger.warn("Invalid or expired token")
         call.respond(HttpStatusCode.Unauthorized, ApiResponse("playlist-service", "Invalid or expired token"))
         return null
     }
     if (requiredRole != null && !user.roles.contains(requiredRole)) {
+        logger.warn("Insufficient permissions for user=${user.username}, required role=$requiredRole")
         call.respond(HttpStatusCode.Forbidden, ApiResponse("playlist-service", "Insufficient permissions"))
         return null
     }
+
+    MDC.put("user", user.username)
     return user
 }
 // ---------- /АВТОРИЗАЦИЯ ----------
@@ -158,6 +163,7 @@ class RabbitMQPublisher {
         try {
             val message = Json.encodeToString(EventMessage.serializer(), event)
             channel?.basicPublish(EXCHANGE_NAME, routingKey, null, message.toByteArray())
+            logger.info("Published event: $routingKey -> ${event.eventType}")
         } catch (e: Exception) {
             logger.error("❌ Failed to publish event: ${e.message}")
         }
@@ -169,27 +175,43 @@ class RabbitMQPublisher {
     }
 }
 
+// Интерцептор для извлечения Request ID
+fun Application.configureRequestIdInterceptor() {
+    intercept(ApplicationCallPipeline.Setup) {
+        val requestId = call.request.headers["X-Request-ID"] ?: UUID.randomUUID().toString()
+        MDC.put("request_id", requestId)
+
+        logger.info("Incoming request: method=${call.request.local.method}, uri=${call.request.local.uri}")
+
+        try {
+            proceed()
+        } finally {
+            MDC.clear()
+        }
+    }
+}
+
 fun main() {
-    val logger = LoggerFactory.getLogger("PlaylistService")
     val rabbitmq = RabbitMQPublisher()
     rabbitmq.connect()
     Runtime.getRuntime().addShutdownHook(Thread { rabbitmq.close() })
 
     embeddedServer(Netty, port = 8080, host = "0.0.0.0") {
         install(ContentNegotiation) { json() }
+        configureRequestIdInterceptor()
 
         routing {
             route("/api/playlists") {
 
                 get {
                     val user = authenticateOrReject(call, requiredRole = "USER") ?: return@get
+                    logger.info("Fetching all playlists for user=${user.username}")
 
                     val playlists = listOf(
                         Playlist(1, "My Rock", listOf(1, 3), owner = user.username),
                         Playlist(2, "Chill", listOf(2), owner = user.username)
                     )
 
-                    // buildJsonObject вместо mapOf<String, Any>
                     val eventData = buildJsonObject {
                         put("count", playlists.size)
                         put("user", user.username)
@@ -204,6 +226,7 @@ fun main() {
                         )
                     )
 
+                    logger.info("Returning ${playlists.size} playlists to user=${user.username}")
                     call.respond(
                         ApiResponse(
                             "playlist-service",
@@ -218,10 +241,12 @@ fun main() {
 
                     val id = call.parameters["id"]?.toIntOrNull()
                     if (id == null) {
+                        logger.warn("Invalid playlist ID requested")
                         call.respond(HttpStatusCode.BadRequest, ApiResponse("playlist-service", "Некорректный ID плейлиста"))
                         return@get
                     }
 
+                    logger.info("Fetching playlist id=$id for user=${user.username}")
                     val pl = Playlist(id, "List #$id", listOf(1, 2, 3), owner = user.username)
 
                     val eventData = buildJsonObject {
@@ -249,8 +274,9 @@ fun main() {
 
                 post {
                     val user = authenticateOrReject(call, requiredRole = "USER") ?: return@post
+                    logger.info("Creating new playlist for user=${user.username}")
 
-                    val req = call.receive<Playlist>()  // owner может не приходить (дефолт есть)
+                    val req = call.receive<Playlist>()
                     val created = req.copy(id = (1000..9999).random(), owner = user.username)
 
                     val eventData = buildJsonObject {
@@ -267,6 +293,7 @@ fun main() {
                         )
                     )
 
+                    logger.info("Playlist created successfully id=${created.id} for user=${user.username}")
                     call.respond(
                         HttpStatusCode.Created,
                         ApiResponse(
