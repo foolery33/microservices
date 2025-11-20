@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  auth-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: auth-service
+    ports:
+      - "8080:8080"
+    environment:
+      KTOR_ENV: "prod"
+    networks:
+      - music-network
+    volumes:
+      - logs-volume:/var/log/auth-service
+
+volumes:
+  logs-volume:
+
+networks:
+  music-network:
+    external: true

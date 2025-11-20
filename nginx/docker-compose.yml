@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  nginx-gateway:
+    image: nginx:alpine
+    container_name: gateway-project
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - logs-volume:/var/log/nginx-json
+    networks:
+      - music-network
+
+volumes:
+  logs-volume:
+
+networks:
+  music-network:
+    external: true
