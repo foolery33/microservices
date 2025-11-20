@@ -81,7 +81,7 @@ fun main() {
 
         routing {
             // Health
-            get("/health") {
+            get("/api/auth/health") {
                 logger.info("Health check requested")
                 call.respond(mapOf("status" to "ok"))
             }
