@@ -1,0 +1,78 @@
+events {
+    worker_connections 1024;
+}
+
+http {
+    # JSON-формат логов
+    log_format json_combined escape=json
+    '{'
+      '"timestamp":"$time_iso8601",'
+      '"service":"nginx-gateway",'
+      '"request_id":"$request_id",'
+      '"client_ip":"$remote_addr",'
+      '"method":"$request_method",'
+      '"uri":"$request_uri",'
+      '"status":$status,'
+      '"response_time":$request_time,'
+      '"upstream_response_time":"$upstream_response_time",'
+      '"user_agent":"$http_user_agent",'
+      '"referer":"$http_referer"'
+    '}';
+
+    # Записываем логи в JSON формате
+    access_log /var/log/nginx-json/nginx-access.log json_combined;
+
+    upstream catalog-service {
+        server catalog-service:8080;
+    }
+
+    upstream playlist-service {
+        server playlist-service:8080;
+    }
+
+    upstream auth-service {
+        server auth-service:8080;
+    }
+
+    server {
+        listen 80;
+        server_name 127.0.0.1;
+
+        # ---------- Auth Service ----------
+        location /api/auth {
+            proxy_set_header X-Request-ID $request_id;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # ---------- Catalog Service ----------
+        location /api/catalog {
+            proxy_set_header X-Request-ID $request_id;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_pass http://catalog-service;
+        }
+
+        # ---------- Playlist Service ----------
+        location /api/playlists {
+            proxy_set_header X-Request-ID $request_id;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_pass http://playlist-service;
+        }
+
+        # ---------- Health-check самого gateway ----------
+        location /health {
+            return 200 "Music Streaming Gateway is healthy\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
